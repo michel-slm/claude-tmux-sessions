@@ -4,7 +4,8 @@
 # (with /rename or --name) count; the others are ignored.
 #
 #   claude-tmux-sessions save          record the live named sessions
-#   claude-tmux-sessions restore [-n]  resume each recorded session in a new
+#   claude-tmux-sessions restore [-n|--dry-run]
+#                                      resume each recorded session in a new
 #                                      window (-n: print what would run)
 #   claude-tmux-sessions rename        name the existing windows after the
 #                                      sessions running in them
@@ -54,7 +55,7 @@ tmux() { "$tmux_bin" -L "$socket" "$@"; }
 
 restore() {
     local dry=0 running name cwd id cmd
-    [ "${1:-}" = -n ] && dry=1
+    case "${1:-}" in -n|--dry-run) dry=1 ;; esac
     [ -s "$state" ] || { echo "no snapshot at $state" >&2; exit 1; }
     running=$(live_sessions | cut -f3)
     while IFS=$'\t' read -r name cwd id; do
@@ -108,5 +109,5 @@ case "${1:-}" in
     restore) shift; restore "$@" ;;
     rename) rename ;;
     list) column -t -s $'\t' "$state" ;;
-    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+    *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
