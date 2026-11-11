@@ -1,0 +1,112 @@
+#!/bin/bash
+# Save the running Claude Code sessions, and relaunch them after a VM
+# restart or crash, one opentmux window each. Only sessions given a name
+# (with /rename or --name) count; the others are ignored.
+#
+#   claude-tmux-sessions save          record the live named sessions
+#   claude-tmux-sessions restore [-n]  resume each recorded session in a new
+#                                      window (-n: print what would run)
+#   claude-tmux-sessions rename        name the existing windows after the
+#                                      sessions running in them
+#   claude-tmux-sessions list          show the saved snapshot
+#
+# Claude Code keeps ~/.claude/sessions/<pid>.json (name, cwd, sessionId)
+# only while a session runs, so `save` copies what is needed into a
+# snapshot that survives a crash. A save that finds no live sessions
+# leaves the old snapshot alone, so saving right after a reboot does not
+# wipe it. `restore` skips sessions that are already running again.
+#
+# Environment: CLAUDE_TMUX (default opentmux), CLAUDE_TMUX_SOCKET
+# (default fedora, i.e. `opentmux -L fedora`).
+set -euo pipefail
+
+state=${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux-sessions.tsv
+tmux_bin=${CLAUDE_TMUX:-opentmux}
+socket=${CLAUDE_TMUX_SOCKET:-fedora}
+
+# name<TAB>cwd<TAB>sessionId<TAB>pid for each live, named, interactive
+# session
+live_sessions() {
+    local f pid
+    for f in "$HOME"/.claude/sessions/*.json; do
+        [ -e "$f" ] || continue
+        pid=$(jq -r .pid "$f")
+        # the pid must still be a claude process, not a reused one
+        [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = claude ] || continue
+        jq -r 'select(.kind == "interactive" and .nameSource == "user")
+               | [.name, .cwd, .sessionId, .pid] | @tsv' "$f"
+    done | sort -f
+}
+
+save() {
+    local tmp
+    tmp=$(live_sessions | cut -f1-3)
+    if [ -z "$tmp" ]; then
+        echo "no live sessions; keeping $state" >&2
+        return 0
+    fi
+    mkdir -p "$(dirname "$state")"
+    printf '%s\n' "$tmp" > "$state.new"
+    mv "$state.new" "$state"
+}
+
+tmux() { "$tmux_bin" -L "$socket" "$@"; }
+
+restore() {
+    local dry=0 running name cwd id cmd
+    [ "${1:-}" = -n ] && dry=1
+    [ -s "$state" ] || { echo "no snapshot at $state" >&2; exit 1; }
+    running=$(live_sessions | cut -f3)
+    while IFS=$'\t' read -r name cwd id; do
+        if grep -qxF "$id" <<<"$running"; then
+            echo "skip $name: already running"
+            continue
+        fi
+        if [ ! -d "$cwd" ]; then
+            echo "skip $name: $cwd does not exist" >&2
+            continue
+        fi
+        if [ $dry = 1 ]; then
+            echo "would open window '$name' in $cwd: claude --resume $id"
+            continue
+        fi
+        # then a shell, so the window stays open if claude exits
+        cmd="claude --resume $id; exec ${SHELL:-/bin/bash}"
+        if tmux has-session 2>/dev/null; then
+            tmux new-window -d -n "$name" -c "$cwd" "$cmd"
+        else
+            tmux new-session -d -n "$name" -c "$cwd" "$cmd"
+        fi
+        echo "opened window '$name'"
+    done < "$state"
+    [ $dry = 1 ] || echo "attach with: $tmux_bin -L $socket attach"
+}
+
+rename() {
+    local pane_pid window name pid p
+    declare -A by_pid
+    while IFS=$'\t' read -r name _ _ pid; do
+        by_pid[$pid]=$name
+    done < <(live_sessions)
+    while read -r pane_pid window; do
+        # find a named claude session whose process descends from the pane
+        for pid in "${!by_pid[@]}"; do
+            p=$pid
+            while [ "$p" -gt 1 ] && [ "$p" != "$pane_pid" ]; do
+                p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null || echo 1)
+            done
+            if [ "$p" = "$pane_pid" ]; then
+                tmux rename-window -t "$window" "${by_pid[$pid]}"
+                echo "window $window: ${by_pid[$pid]}"
+            fi
+        done
+    done < <(tmux list-panes -a -F '#{pane_pid} #{window_id}')
+}
+
+case "${1:-}" in
+    save) save ;;
+    restore) shift; restore "$@" ;;
+    rename) rename ;;
+    list) column -t -s $'\t' "$state" ;;
+    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+esac
