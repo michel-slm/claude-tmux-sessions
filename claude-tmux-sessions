@@ -9,6 +9,7 @@
 #                                      window (-n: print what would run)
 #   claude-tmux-sessions rename        name the existing windows after the
 #                                      sessions running in them
+#   claude-tmux-sessions sync          save, then rename (for a Stop hook)
 #   claude-tmux-sessions list          show the saved snapshot
 #
 # Claude Code keeps ~/.claude/sessions/<pid>.json (name, cwd, sessionId)
@@ -108,6 +109,7 @@ case "${1:-}" in
     save) save ;;
     restore) shift; restore "$@" ;;
     rename) rename ;;
+    sync) save; rename ;;
     list) column -t -s $'\t' "$state" ;;
-    *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+    *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
