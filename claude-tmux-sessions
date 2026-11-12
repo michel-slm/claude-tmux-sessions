@@ -79,7 +79,12 @@ live_sessions() {
         pid=$(jq -r .pid "$f")
         # the pid must still be a claude process, not a reused one
         [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = claude ] || continue
-        env=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || continue
+        # keep only the two variables needed, so the rest of the
+        # environment (secrets included) never lands in a variable or
+        # in `bash -x` output
+        env=$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" |
+            grep -E '^(CONTAINER_ID|TMUX)='
+            exit "${PIPESTATUS[0]}") || continue
         [ "$(sed -n 's/^CONTAINER_ID=//p' <<<"$env")" = "${CONTAINER_ID:-}" ] ||
             continue
         # $TMUX is "socket,server pid,session"
