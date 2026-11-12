@@ -22,37 +22,58 @@
 #
 # Claude Code keeps ~/.claude/sessions/<pid>.json (name, cwd, sessionId)
 # only while a session runs, so `save` copies what is needed into a
-# snapshot that survives a crash, along with the tmux server (from the
-# session's $TMUX) and window position. A save that finds no live
+# snapshot that survives a crash, along with the tmux server (socket from
+# the session's $TMUX, binary from the server process) and window
+# position, so a server run by tmux or opentmux is reached with the same
+# program. A save that finds no live
 # sessions leaves the old snapshot alone, so saving right after a reboot
 # does not wipe it. `restore` skips sessions that are already running
 # again, and appends the windows in their saved order.
 #
-# Environment: CLAUDE_TMUX (default opentmux if installed, else tmux),
-# CLAUDE_TMUX_SOCKET (server name for sessions saved outside tmux,
-# default fedora, i.e. `opentmux -L fedora`).
+# Environment: CLAUDE_TMUX (the tmux program; overrides the recorded one,
+# else opentmux if installed, else tmux), CLAUDE_TMUX_SOCKET (server
+# name for sessions saved outside tmux, default fedora, i.e.
+# `opentmux -L fedora`).
 set -euo pipefail
 
 container=${CONTAINER_ID:-host}
 state=${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux-sessions/$container.tsv
-tmux_bin=${CLAUDE_TMUX:-$(command -v opentmux || echo tmux)}
+fallback_bin=$(command -v opentmux || echo tmux)
 default_socket=${CLAUDE_TMUX_SOCKET:-fedora}
 
-# tmux on the server at socket path $1 ("" for the default server)
-tmux_at() {
-    local sock=$1
-    shift
-    if [ -n "$sock" ]; then
-        "$tmux_bin" -S "$sock" "$@"
+# the tmux program to use for a server recorded as run by $1
+pick_bin() {
+    if [ -n "${CLAUDE_TMUX:-}" ]; then
+        echo "$CLAUDE_TMUX"
+    elif [ -n "$1" ] && [ -x "$1" ]; then
+        echo "$1"
     else
-        "$tmux_bin" -L "$default_socket" "$@"
+        echo "$fallback_bin"
     fi
 }
 
-# name<TAB>cwd<TAB>sessionId<TAB>pid<TAB>socket for each live, named,
-# interactive session of this container
+# tmux program $1 on the server at socket path $2 ("" for the default
+# server)
+tmux_at() {
+    local bin sock=$2
+    bin=$(pick_bin "$1")
+    shift 2
+    if [ -n "$sock" ]; then
+        "$bin" -S "$sock" "$@"
+    else
+        "$bin" -L "$default_socket" "$@"
+    fi
+}
+
+# the server option for socket path $1, for messages
+server_opt() {
+    if [ -n "$1" ]; then echo "-S $1"; else echo "-L $default_socket"; fi
+}
+
+# name<TAB>cwd<TAB>sessionId<TAB>pid<TAB>socket<TAB>tmux program for each
+# live, named, interactive session of this container
 live_sessions() {
-    local f pid env sock
+    local f pid env tmux_env sock bin
     for f in "$HOME"/.claude/sessions/*.json; do
         [ -e "$f" ] || continue
         pid=$(jq -r .pid "$f")
@@ -62,29 +83,37 @@ live_sessions() {
         [ "$(sed -n 's/^CONTAINER_ID=//p' <<<"$env")" = "${CONTAINER_ID:-}" ] ||
             continue
         # $TMUX is "socket,server pid,session"
-        sock=$(sed -n 's/^TMUX=\([^,]*\),.*/\1/p' <<<"$env")
-        jq -r --arg sock "$sock" \
+        tmux_env=$(sed -n 's/^TMUX=//p' <<<"$env")
+        sock=${tmux_env%%,*}
+        bin=""
+        if [ -n "$tmux_env" ]; then
+            tmux_env=${tmux_env#*,}
+            # an upgraded binary reads as "<path> (deleted)"
+            bin=$(readlink "/proc/${tmux_env%%,*}/exe" 2>/dev/null || true)
+            bin=${bin% (deleted)}
+        fi
+        jq -r --arg sock "$sock" --arg bin "$bin" \
             'select(.kind == "interactive" and .nameSource == "user")
-             | [.name, .cwd, .sessionId, .pid, $sock] | @tsv' "$f"
+             | [.name, .cwd, .sessionId, .pid, $sock, $bin] | @tsv' "$f"
     done
 }
 
 # live_sessions plus the tmux session, window index and window id each
 # one runs in (empty when it is not in a tmux window), in window order
 located_sessions() {
-    local name cwd id pid sock p loc
+    local name cwd id pid sock bin p loc
     declare -A panes
-    local socks
-    socks=$(live_sessions | cut -f5 | sort -u)
-    while read -r sock; do
+    local servers
+    servers=$(live_sessions | cut -f5,6 | sort -u)
+    while IFS=$'\t' read -r sock bin; do
         [ -n "$sock" ] || continue
         while IFS=$'\t' read -r p loc; do
             panes[$sock/$p]=$loc
-        done < <(tmux_at "$sock" list-panes -a \
+        done < <(tmux_at "$bin" "$sock" list-panes -a \
             -F $'#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_id}' \
             2>/dev/null || true)
-    done <<<"$socks"
-    live_sessions | while IFS=$'\t' read -r name cwd id pid sock; do
+    done <<<"$servers"
+    live_sessions | while IFS=$'\t' read -r name cwd id pid sock bin; do
         # walk up from the claude process to the pane's shell
         loc=$'\t\t'
         p=$pid
@@ -95,14 +124,15 @@ located_sessions() {
             fi
             p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null || echo 1)
         done
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$cwd" "$id" "$pid" "$sock" "$loc"
-    done | sort -t $'\t' -k5,5 -k6,6 -k7,7n -k1,1f
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$name" "$cwd" "$id" "$pid" "$sock" "$bin" "$loc"
+    done | sort -t $'\t' -k5,5 -k7,7 -k8,8n -k1,1f
 }
 
 save() {
     local tmp
-    # name, cwd, sessionId, socket; the rows are in window order
-    tmp=$(located_sessions | cut -f1-3,5)
+    # name, cwd, sessionId, socket, tmux program; in window order
+    tmp=$(located_sessions | cut -f1-3,5,6)
     if [ -z "$tmp" ]; then
         echo "no live sessions in $container; keeping $state" >&2
         return 0
@@ -113,12 +143,12 @@ save() {
 }
 
 restore() {
-    local dry=0 running name cwd id sock cmd
+    local dry=0 running name cwd id sock bin cmd
     declare -A attach=()
     case "${1:-}" in -n|--dry-run) dry=1 ;; esac
     [ -s "$state" ] || { echo "no snapshot at $state" >&2; exit 1; }
     running=$(live_sessions | cut -f3)
-    while IFS=$'\t' read -r name cwd id sock; do
+    while IFS=$'\t' read -r name cwd id sock bin; do
         if grep -qxF "$id" <<<"$running"; then
             echo "skip $name: already running"
             continue
@@ -128,25 +158,23 @@ restore() {
             continue
         fi
         if [ $dry = 1 ]; then
-            echo "would open window '$name' in $cwd on ${sock:-$default_socket}:" \
+            echo "would open window '$name' in $cwd with" \
+                "$(pick_bin "$bin") $(server_opt "$sock"):" \
                 "claude --resume $id"
             continue
         fi
         # then a shell, so the window stays open if claude exits
         cmd="claude --resume $id; exec ${SHELL:-/bin/bash}"
-        if tmux_at "$sock" has-session 2>/dev/null; then
+        if tmux_at "$bin" "$sock" has-session 2>/dev/null; then
             # append after the last window, keeping the saved order
-            tmux_at "$sock" new-window -d -a -t '{end}' -n "$name" -c "$cwd" "$cmd"
+            tmux_at "$bin" "$sock" new-window -d -a -t '{end}' -n "$name" \
+                -c "$cwd" "$cmd"
         else
             [ -z "$sock" ] || mkdir -p -m 700 "$(dirname "$sock")"
-            tmux_at "$sock" new-session -d -n "$name" -c "$cwd" "$cmd"
+            tmux_at "$bin" "$sock" new-session -d -n "$name" -c "$cwd" "$cmd"
         fi
         echo "opened window '$name'"
-        if [ -n "$sock" ]; then
-            attach["$tmux_bin -S $sock attach"]=1
-        else
-            attach["$tmux_bin -L $default_socket attach"]=1
-        fi
+        attach["$(pick_bin "$bin") $(server_opt "$sock") attach"]=1
     done < "$state"
     for cmd in "${!attach[@]}"; do
         echo "attach with: $cmd"
@@ -154,10 +182,10 @@ restore() {
 }
 
 rename() {
-    local name sock wid
-    located_sessions | while IFS=$'\t' read -r name _ _ _ sock _ _ wid; do
+    local name sock bin wid
+    located_sessions | while IFS=$'\t' read -r name _ _ _ sock bin _ _ wid; do
         [ -n "$wid" ] || continue
-        tmux_at "$sock" rename-window -t "$wid" "$name"
+        tmux_at "$bin" "$sock" rename-window -t "$wid" "$name"
         echo "window $wid: $name"
     done
 }
