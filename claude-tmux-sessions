@@ -1,9 +1,11 @@
 #!/bin/bash
 # Save the running Claude Code sessions, and relaunch them after a VM
-# restart or crash, one opentmux window each. Only sessions given a name
-# (with /rename or --name) count; the others are ignored.
+# restart or crash, one tmux window each, in their original order. Only
+# sessions given a name (with /rename or --name) count; the others are
+# ignored.
 #
-#   claude-tmux-sessions save          record the live named sessions
+#   claude-tmux-sessions save          record this container's live named
+#                                      sessions and their window order
 #   claude-tmux-sessions restore [-n|--dry-run]
 #                                      resume each recorded session in a new
 #                                      window (-n: print what would run)
@@ -12,39 +14,97 @@
 #   claude-tmux-sessions sync          save, then rename (for a Stop hook)
 #   claude-tmux-sessions list          show the saved snapshot
 #
+# Each distrobox container keeps its own snapshot (by $CONTAINER_ID, or
+# "host" outside one), because its sessions need its own claude and tmux
+# to restart. Run restore inside the container. Home and the PID namespace
+# are shared, so every container sees all sessions; a session belongs to
+# the container named in its process's environment.
+#
 # Claude Code keeps ~/.claude/sessions/<pid>.json (name, cwd, sessionId)
 # only while a session runs, so `save` copies what is needed into a
-# snapshot that survives a crash. A save that finds no live sessions
-# leaves the old snapshot alone, so saving right after a reboot does not
-# wipe it. `restore` skips sessions that are already running again.
+# snapshot that survives a crash, along with the tmux server (from the
+# session's $TMUX) and window position. A save that finds no live
+# sessions leaves the old snapshot alone, so saving right after a reboot
+# does not wipe it. `restore` skips sessions that are already running
+# again, and appends the windows in their saved order.
 #
-# Environment: CLAUDE_TMUX (default opentmux), CLAUDE_TMUX_SOCKET
-# (default fedora, i.e. `opentmux -L fedora`).
+# Environment: CLAUDE_TMUX (default opentmux if installed, else tmux),
+# CLAUDE_TMUX_SOCKET (server name for sessions saved outside tmux,
+# default fedora, i.e. `opentmux -L fedora`).
 set -euo pipefail
 
-state=${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux-sessions.tsv
-tmux_bin=${CLAUDE_TMUX:-opentmux}
-socket=${CLAUDE_TMUX_SOCKET:-fedora}
+container=${CONTAINER_ID:-host}
+state=${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux-sessions/$container.tsv
+tmux_bin=${CLAUDE_TMUX:-$(command -v opentmux || echo tmux)}
+default_socket=${CLAUDE_TMUX_SOCKET:-fedora}
 
-# name<TAB>cwd<TAB>sessionId<TAB>pid for each live, named, interactive
-# session
+# tmux on the server at socket path $1 ("" for the default server)
+tmux_at() {
+    local sock=$1
+    shift
+    if [ -n "$sock" ]; then
+        "$tmux_bin" -S "$sock" "$@"
+    else
+        "$tmux_bin" -L "$default_socket" "$@"
+    fi
+}
+
+# name<TAB>cwd<TAB>sessionId<TAB>pid<TAB>socket for each live, named,
+# interactive session of this container
 live_sessions() {
-    local f pid
+    local f pid env sock
     for f in "$HOME"/.claude/sessions/*.json; do
         [ -e "$f" ] || continue
         pid=$(jq -r .pid "$f")
         # the pid must still be a claude process, not a reused one
         [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = claude ] || continue
-        jq -r 'select(.kind == "interactive" and .nameSource == "user")
-               | [.name, .cwd, .sessionId, .pid] | @tsv' "$f"
-    done | sort -f
+        env=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || continue
+        [ "$(sed -n 's/^CONTAINER_ID=//p' <<<"$env")" = "${CONTAINER_ID:-}" ] ||
+            continue
+        # $TMUX is "socket,server pid,session"
+        sock=$(sed -n 's/^TMUX=\([^,]*\),.*/\1/p' <<<"$env")
+        jq -r --arg sock "$sock" \
+            'select(.kind == "interactive" and .nameSource == "user")
+             | [.name, .cwd, .sessionId, .pid, $sock] | @tsv' "$f"
+    done
+}
+
+# live_sessions plus the tmux session, window index and window id each
+# one runs in (empty when it is not in a tmux window), in window order
+located_sessions() {
+    local name cwd id pid sock p loc
+    declare -A panes
+    local socks
+    socks=$(live_sessions | cut -f5 | sort -u)
+    while read -r sock; do
+        [ -n "$sock" ] || continue
+        while IFS=$'\t' read -r p loc; do
+            panes[$sock/$p]=$loc
+        done < <(tmux_at "$sock" list-panes -a \
+            -F $'#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_id}' \
+            2>/dev/null || true)
+    done <<<"$socks"
+    live_sessions | while IFS=$'\t' read -r name cwd id pid sock; do
+        # walk up from the claude process to the pane's shell
+        loc=$'\t\t'
+        p=$pid
+        while [ -n "$sock" ] && [ "$p" -gt 1 ]; do
+            if [ -n "${panes[$sock/$p]:-}" ]; then
+                loc=${panes[$sock/$p]}
+                break
+            fi
+            p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null || echo 1)
+        done
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$cwd" "$id" "$pid" "$sock" "$loc"
+    done | sort -t $'\t' -k5,5 -k6,6 -k7,7n -k1,1f
 }
 
 save() {
     local tmp
-    tmp=$(live_sessions | cut -f1-3)
+    # name, cwd, sessionId, socket; the rows are in window order
+    tmp=$(located_sessions | cut -f1-3,5)
     if [ -z "$tmp" ]; then
-        echo "no live sessions; keeping $state" >&2
+        echo "no live sessions in $container; keeping $state" >&2
         return 0
     fi
     mkdir -p "$(dirname "$state")"
@@ -52,14 +112,13 @@ save() {
     mv "$state.new" "$state"
 }
 
-tmux() { "$tmux_bin" -L "$socket" "$@"; }
-
 restore() {
-    local dry=0 running name cwd id cmd
+    local dry=0 running name cwd id sock cmd
+    declare -A attach=()
     case "${1:-}" in -n|--dry-run) dry=1 ;; esac
     [ -s "$state" ] || { echo "no snapshot at $state" >&2; exit 1; }
     running=$(live_sessions | cut -f3)
-    while IFS=$'\t' read -r name cwd id; do
+    while IFS=$'\t' read -r name cwd id sock; do
         if grep -qxF "$id" <<<"$running"; then
             echo "skip $name: already running"
             continue
@@ -69,40 +128,38 @@ restore() {
             continue
         fi
         if [ $dry = 1 ]; then
-            echo "would open window '$name' in $cwd: claude --resume $id"
+            echo "would open window '$name' in $cwd on ${sock:-$default_socket}:" \
+                "claude --resume $id"
             continue
         fi
         # then a shell, so the window stays open if claude exits
         cmd="claude --resume $id; exec ${SHELL:-/bin/bash}"
-        if tmux has-session 2>/dev/null; then
-            tmux new-window -d -n "$name" -c "$cwd" "$cmd"
+        if tmux_at "$sock" has-session 2>/dev/null; then
+            # append after the last window, keeping the saved order
+            tmux_at "$sock" new-window -d -a -t '{end}' -n "$name" -c "$cwd" "$cmd"
         else
-            tmux new-session -d -n "$name" -c "$cwd" "$cmd"
+            [ -z "$sock" ] || mkdir -p -m 700 "$(dirname "$sock")"
+            tmux_at "$sock" new-session -d -n "$name" -c "$cwd" "$cmd"
         fi
         echo "opened window '$name'"
+        if [ -n "$sock" ]; then
+            attach["$tmux_bin -S $sock attach"]=1
+        else
+            attach["$tmux_bin -L $default_socket attach"]=1
+        fi
     done < "$state"
-    [ $dry = 1 ] || echo "attach with: $tmux_bin -L $socket attach"
+    for cmd in "${!attach[@]}"; do
+        echo "attach with: $cmd"
+    done
 }
 
 rename() {
-    local pane_pid window name pid p
-    declare -A by_pid
-    while IFS=$'\t' read -r name _ _ pid; do
-        by_pid[$pid]=$name
-    done < <(live_sessions)
-    while read -r pane_pid window; do
-        # find a named claude session whose process descends from the pane
-        for pid in "${!by_pid[@]}"; do
-            p=$pid
-            while [ "$p" -gt 1 ] && [ "$p" != "$pane_pid" ]; do
-                p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null || echo 1)
-            done
-            if [ "$p" = "$pane_pid" ]; then
-                tmux rename-window -t "$window" "${by_pid[$pid]}"
-                echo "window $window: ${by_pid[$pid]}"
-            fi
-        done
-    done < <(tmux list-panes -a -F '#{pane_pid} #{window_id}')
+    local name sock wid
+    located_sessions | while IFS=$'\t' read -r name _ _ _ sock _ _ wid; do
+        [ -n "$wid" ] || continue
+        tmux_at "$sock" rename-window -t "$wid" "$name"
+        echo "window $wid: $name"
+    done
 }
 
 case "${1:-}" in
@@ -111,5 +168,5 @@ case "${1:-}" in
     rename) rename ;;
     sync) save; rename ;;
     list) column -t -s $'\t' "$state" ;;
-    *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
