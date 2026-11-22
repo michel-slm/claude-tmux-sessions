@@ -20,6 +20,10 @@
 #                                      put a backup's transcripts and
 #                                      snapshots in place, and list the
 #                                      directories missing here
+#   claude-tmux-sessions move [-n|--dry-run] <old dir> <new dir>
+#                                      move the transcripts, memory and
+#                                      snapshot entries of the stopped
+#                                      sessions of a directory that moved
 #
 # Each distrobox container keeps its own snapshot (by $CONTAINER_ID, or
 # "host" outside one), because its sessions need its own claude and tmux
@@ -49,6 +53,24 @@
 # transcript directories that don't exist on this machine; it exits 3
 # if any session directory is missing. Paths are kept as they were, so
 # the machines need the same home directory and container names.
+#
+# `move` is for a checkout or folder that moved (another owner, a
+# synced folder reached through a symlink). Claude Code files a
+# session's transcripts and memory under ~/.claude/projects/ by the
+# directory it started in (symlinks resolved, each non-alphanumeric
+# character as "-"), and `claude --resume` only finds them under the
+# current directory's name. Move the directory first, then run `move`
+# with the old path and the new one: it moves the project folders of
+# the directory and of directories under it, merging into folders that
+# already exist (MEMORY.md lines are appended; any other file in both
+# stops it before anything changes), rewrites the "cwd" fields in
+# their transcripts that name the old path (keeping the files' times,
+# for restore), and updates every container's snapshot. It refuses
+# while a session of either directory is running. Left alone, and
+# listed: memory files that mention the old path, and Claude Code's
+# per-directory settings in ~/.claude.json (trust, allowed tools),
+# which other sessions rewrite while they run, so Claude Code asks
+# for trust again on the first start in the new directory.
 #
 # Environment: CLAUDE_TMUX (the tmux program; overrides the recorded one,
 # else opentmux if installed, else tmux), CLAUDE_TMUX_SOCKET (server
@@ -308,6 +330,173 @@ restore() {
     return $rc
 }
 
+# the folder name Claude Code files a directory's sessions under
+project_key() {
+    echo "${1//[^A-Za-z0-9]/-}"
+}
+
+# $1 escaped for a sed regex or replacement with | as the delimiter
+# shellcheck disable=SC2001  # a bracket expression, not a fixed string
+sed_re() { sed 's/[][\.*^$|]/\\&/g' <<<"$1"; }
+# shellcheck disable=SC2001
+sed_repl() { sed 's/[\&|]/\\&/g' <<<"$1"; }
+
+# rewrite the "cwd" fields naming $2 or a path under it in transcript
+# $1 to name $3 instead, keeping the file's time
+rewrite_cwd() {
+    local f=$1 tmp
+    grep -qF "\"cwd\":\"$2" "$f" || return 0
+    tmp=$f.move-tmp
+    sed "s|\"cwd\":\"$(sed_re "$2")\([/\"]\)|\"cwd\":\"$(sed_repl "$3")\1|g" \
+        "$f" > "$tmp"
+    touch -r "$f" "$tmp"
+    mv "$tmp" "$f"
+}
+
+move() {
+    local dry=0 old new projects d dir cwd src dest key f rel conflicts
+    local running plan rows tmp
+    case "${1:-}" in -n|--dry-run) dry=1; shift ;; esac
+    if [ $# != 2 ]; then
+        echo "usage: $0 move [-n|--dry-run] <old dir> <new dir>" >&2
+        exit 2
+    fi
+    old=${1%/} new=${2%/}
+    [ -d "$new" ] ||
+        { echo "$new does not exist; move or clone it first" >&2; exit 1; }
+    new=$(readlink -f "$new")
+    # the old path as sessions recorded it: symlinks resolved, if it
+    # is still there
+    [ ! -d "$old" ] || old=$(readlink -f "$old")
+    case $old in /*) ;; *)
+        echo "$old: give an absolute path" >&2; exit 2 ;;
+    esac
+    [ "$old" != "$new" ] || { echo "$old and $new are the same" >&2; exit 1; }
+    case $old$new in *[\"\\]*)
+        echo "paths with \" or \\ are not supported" >&2; exit 1 ;;
+    esac
+    projects=$HOME/.claude/projects
+    key=$(project_key "$old")
+
+    # source<TAB>destination project folder: the old directory's own,
+    # and those of directories under it (by the directory their
+    # transcripts started in, since keys alone are ambiguous)
+    plan=$(for d in "$projects/$key" "$projects/$key"-*; do
+        [ -d "$d" ] || continue
+        if [ "$d" = "$projects/$key" ]; then
+            dir=$old
+        else
+            cwd=$(project_cwd "$d") || continue
+            case $cwd in "$old"/*) dir=$cwd ;; *) continue ;; esac
+        fi
+        printf '%s\t%s\n' "$d" "$projects/$(project_key "$new${dir#"$old"}")"
+    done)
+    if [ -z "$plan" ]; then
+        echo "no sessions recorded for $old" >&2
+        exit 1
+    fi
+
+    # no session of either side may be running: it would keep writing
+    # under the old name, or into the folder being merged into
+    running=$(for f in "$HOME"/.claude/sessions/*.json; do
+        [ -e "$f" ] || continue
+        [ "$(cat "/proc/$(jq -r .pid "$f")/comm" 2>/dev/null)" = claude ] ||
+            continue
+        cwd=$(jq -r .cwd "$f")
+        d=$projects/$(project_key "$cwd")
+        if cut -f1,2 <<<"$plan" | tr '\t' '\n' | grep -qxF "$d"; then
+            jq -r '"  \(.name // "unnamed") (pid \(.pid)) in \(.cwd)"' "$f"
+        fi
+    done)
+    if [ -n "$running" ] && [ $dry = 1 ]; then
+        printf 'running, exit them first:\n%s\n' "$running" >&2
+    elif [ -n "$running" ]; then
+        printf 'running, nothing moved:\n%s\n' "$running" >&2
+        echo "exit them first" >&2
+        exit 1
+    fi
+
+    # a file in both folders, other than MEMORY.md, stops everything
+    conflicts=$(while IFS=$'\t' read -r src dest; do
+        [ -d "$dest" ] || continue
+        (cd "$src" && find . -type f) | while read -r rel; do
+            rel=${rel#./}
+            [ "$rel" != memory/MEMORY.md ] || continue
+            [ ! -e "$dest/$rel" ] || echo "  $dest/$rel"
+        done
+    done <<<"$plan")
+    if [ -n "$conflicts" ]; then
+        printf 'in both folders, nothing moved:\n%s\n' "$conflicts" >&2
+        exit 1
+    fi
+
+    rows=$(for f in "$state_dir"/*.tsv; do
+        [ -e "$f" ] || continue
+        awk -F '\t' -v old="$old" -v c="$(basename "$f" .tsv)" \
+            '$2 == old || index($2, old "/") == 1 {print "  " c ": " $1}' "$f"
+    done)
+
+    while IFS=$'\t' read -r src dest; do
+        if [ -d "$dest" ]; then
+            echo "merge $src into $dest"
+        else
+            echo "move $src to $dest"
+        fi
+    done <<<"$plan"
+    [ -z "$rows" ] || printf 'update snapshot entries:\n%s\n' "$rows"
+    if [ $dry = 1 ]; then
+        return 0
+    fi
+
+    while IFS=$'\t' read -r src dest; do
+        while read -r f; do
+            rewrite_cwd "$f" "$old" "$new"
+        done < <(find "$src" -name '*.jsonl')
+        if [ ! -d "$dest" ]; then
+            mv "$src" "$dest"
+            continue
+        fi
+        (cd "$src" && find . -type f) | while read -r rel; do
+            rel=${rel#./}
+            if [ "$rel" = memory/MEMORY.md ] && [ -e "$dest/$rel" ]; then
+                # append the index lines the destination lacks
+                tmp=$(grep -vxF -f "$dest/$rel" "$src/$rel" || true)
+                [ -z "$tmp" ] || printf '%s\n' "$tmp" >> "$dest/$rel"
+                rm "$src/$rel"
+            else
+                mkdir -p "$(dirname "$dest/$rel")"
+                mv "$src/$rel" "$dest/$rel"
+            fi
+        done
+        find "$src" -depth -type d -empty -delete
+        [ ! -d "$src" ] || echo "left behind in $src: $(ls -A "$src")" >&2
+    done <<<"$plan"
+
+    for f in "$state_dir"/*.tsv; do
+        [ -e "$f" ] || continue
+        tmp=$f.new
+        awk -F '\t' -v OFS='\t' -v old="$old" -v new="$new" '
+            $2 == old || index($2, old "/") == 1 {
+                $2 = new substr($2, length(old) + 1)
+            }
+            {print}' "$f" > "$tmp"
+        if cmp -s "$f" "$tmp"; then rm "$tmp"; else mv "$tmp" "$f"; fi
+    done
+
+    # what is left to do by hand
+    while IFS=$'\t' read -r _ dest; do
+        [ -d "$dest/memory" ] || continue
+        grep -rlF "$old" "$dest/memory" | sed 's/^/mentions the old path: /'
+    done <<<"$plan"
+    if jq -e --arg d "$old" '.projects | has($d)' "$HOME/.claude.json" \
+        >/dev/null 2>&1; then
+        # shellcheck disable=SC2088  # printed, not expanded
+        echo "~/.claude.json keeps the settings of $old (trust, allowed" \
+            "tools); Claude Code asks for trust again in $new"
+    fi
+    echo "resume from $new with claude --resume <id>, or with resume"
+}
+
 rename() {
     local name sock bin wid
     located_sessions | while IFS=$'\t' read -r name _ _ _ sock bin _ _ wid; do
@@ -325,5 +514,6 @@ case "${1:-}" in
     list) column -t -s $'\t' "$state" ;;
     backup) shift; backup "$@" ;;
     restore) shift; restore "$@" ;;
-    *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+    move) shift; move "$@" ;;
+    *) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
