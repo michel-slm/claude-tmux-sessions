@@ -6,17 +6,24 @@
 #
 #   claude-tmux-sessions save          record this container's live named
 #                                      sessions and their window order
-#   claude-tmux-sessions restore [-n|--dry-run]
+#   claude-tmux-sessions resume [-n|--dry-run]
 #                                      resume each recorded session in a new
 #                                      window (-n: print what would run)
 #   claude-tmux-sessions rename        name the existing windows after the
 #                                      sessions running in them
 #   claude-tmux-sessions sync          save, then rename (for a Stop hook)
 #   claude-tmux-sessions list          show the saved snapshot
+#   claude-tmux-sessions backup <dir>  save, then write the snapshots and
+#                                      transcripts, encrypted with a
+#                                      passphrase, to a file in <dir>
+#   claude-tmux-sessions restore <file>
+#                                      put a backup's transcripts and
+#                                      snapshots in place, and list the
+#                                      directories missing here
 #
 # Each distrobox container keeps its own snapshot (by $CONTAINER_ID, or
 # "host" outside one), because its sessions need its own claude and tmux
-# to restart. Run restore inside the container. Home and the PID namespace
+# to restart. Run resume and restore inside the container. Home and the PID namespace
 # are shared, so every container sees all sessions; a session belongs to
 # the container named in its process's environment.
 #
@@ -27,17 +34,41 @@
 # position, so a server run by tmux or opentmux is reached with the same
 # program. A save that finds no live
 # sessions leaves the old snapshot alone, so saving right after a reboot
-# does not wipe it. `restore` skips sessions that are already running
-# again, and appends the windows in their saved order.
+# does not wipe it. `resume` skips sessions that are already running
+# again, and appends the windows in their saved order. It refuses to
+# start any session while a saved session's directory is missing, so
+# the checkouts can be cloned first.
+#
+# `backup` moves sessions to another machine, e.g. through a synced
+# folder: it writes claude-backup-<host>-<time>.tar.zst.gpg with every
+# container's snapshot and ~/.claude/projects (transcripts and memory),
+# encrypted with `gpg --symmetric` (gpg asks for the passphrase). The
+# transcripts of sessions under ~/src/embargoed are left out. `restore`
+# decrypts one, copies in each file that is missing here or older (a
+# newer local transcript is kept), and lists the session and
+# transcript directories that don't exist on this machine; it exits 3
+# if any session directory is missing. Paths are kept as they were, so
+# the machines need the same home directory and container names.
 #
 # Environment: CLAUDE_TMUX (the tmux program; overrides the recorded one,
 # else opentmux if installed, else tmux), CLAUDE_TMUX_SOCKET (server
 # name for sessions saved outside tmux, default fedora, i.e.
 # `opentmux -L fedora`).
 set -euo pipefail
+umask 077
 
 container=${CONTAINER_ID:-host}
-state=${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux-sessions/$container.tsv
+state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux-sessions
+state=$state_dir/$container.tsv
+# extra gpg options for backup and restore (used by tests)
+read -ra gpg_opts <<<"${CLAUDE_BACKUP_GPG_OPTS:-}"
+
+# backup and restore store paths relative to the home directory
+need_state_in_home() {
+    case $state_dir in "$HOME"/*) ;; *)
+        echo "$state_dir is outside $HOME; not supported" >&2; exit 1 ;;
+    esac
+}
 fallback_bin=$(command -v opentmux || echo tmux)
 default_socket=${CLAUDE_TMUX_SOCKET:-fedora}
 
@@ -147,19 +178,25 @@ save() {
     mv "$state.new" "$state"
 }
 
-restore() {
-    local dry=0 running name cwd id sock bin cmd
+resume() {
+    local dry=0 running missing name cwd id sock bin cmd
     declare -A attach=()
     case "${1:-}" in -n|--dry-run) dry=1 ;; esac
     [ -s "$state" ] || { echo "no snapshot at $state" >&2; exit 1; }
     running=$(live_sessions | cut -f3)
+    # check every directory before starting anything
+    missing=$(while IFS=$'\t' read -r name cwd id _; do
+        grep -qxF "$id" <<<"$running" || [ -d "$cwd" ] ||
+            printf '  %s: %s\n' "$name" "$cwd"
+    done < "$state")
+    if [ -n "$missing" ]; then
+        printf 'missing directories, nothing started:\n%s\n' "$missing" >&2
+        echo "clone or create them, then run resume again" >&2
+        exit 1
+    fi
     while IFS=$'\t' read -r name cwd id sock bin; do
         if grep -qxF "$id" <<<"$running"; then
             echo "skip $name: already running"
-            continue
-        fi
-        if [ ! -d "$cwd" ]; then
-            echo "skip $name: $cwd does not exist" >&2
             continue
         fi
         if [ $dry = 1 ]; then
@@ -186,6 +223,91 @@ restore() {
     done
 }
 
+# the directory a project's transcripts were recorded in, from the
+# first "cwd" field in them
+project_cwd() {
+    local f
+    for f in "$1"/*.jsonl; do
+        [ -e "$f" ] || continue
+        grep -m1 -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//; s/"$//' &&
+            return 0
+    done
+    return 1
+}
+
+# kind<TAB>label<TAB>directory for what a backup needs on the other
+# machine: each saved session's directory, then each project's
+backup_manifest() {
+    local f d cwd
+    for f in "$state_dir"/*.tsv; do
+        [ -e "$f" ] || continue
+        cut -f1,2 "$f" | sed "s|^|session\t$(basename "$f" .tsv)/|"
+    done
+    for d in "$HOME"/.claude/projects/*/; do
+        d=${d%/}
+        case $d in *-src-embargoed*) continue ;; esac
+        cwd=$(project_cwd "$d") || continue
+        printf 'transcripts\t%s\t%s\n' "$(basename "$d")" "$cwd"
+    done
+}
+
+backup() {
+    local dest=${1:-} out
+    [ -n "$dest" ] || { echo "usage: $0 backup <dir>" >&2; exit 2; }
+    [ -d "$dest" ] || { echo "$dest is not a directory" >&2; exit 1; }
+    need_state_in_home
+    save
+    out=$dest/claude-backup-$(hostname -s)-$(date +%Y%m%dT%H%M).tar.zst.gpg
+    # global, and on EXIT: with set -e a failure exits without
+    # returning, and the trap runs after the function's locals are gone
+    workdir=$(mktemp -d)
+    trap 'rm -rf "$workdir"' EXIT
+    mkdir "$workdir/claude-backup"
+    backup_manifest > "$workdir/claude-backup/manifest.tsv"
+    # a partial file must not sync, so write next to it and rename
+    tar -cf - -C "$HOME" \
+            --exclude='.claude/projects/*-src-embargoed*' \
+            .claude/projects \
+            "${state_dir#"$HOME"/}" \
+            -C "$workdir" claude-backup/manifest.tsv |
+        zstd -q -T0 |
+        gpg --symmetric --cipher-algo AES256 --no-symkey-cache \
+            "${gpg_opts[@]}" -o "$out.part"
+    mv "$out.part" "$out"
+    echo "wrote $out ($(du -h "$out" | cut -f1))"
+}
+
+restore() {
+    local file=${1:-} kind label dir rc=0 have
+    [ -n "$file" ] || { echo "usage: $0 restore <file>" >&2; exit 2; }
+    need_state_in_home
+    # global, and on EXIT: with set -e a failure exits without
+    # returning, and the trap runs after the function's locals are gone
+    workdir=$(mktemp -d)
+    trap 'rm -rf "$workdir"' EXIT
+    gpg --decrypt --no-symkey-cache "${gpg_opts[@]}" "$file" |
+        zstd -q -d | tar -C "$workdir" -xf -
+    # keep a local file that is newer than the backup's
+    (cd "$workdir" && find .claude "${state_dir#"$HOME"/}" -type f) |
+        while read -r f; do
+            if [ ! -e "$HOME/$f" ] || [ "$workdir/$f" -nt "$HOME/$f" ]; then
+                mkdir -p "$(dirname "$HOME/$f")"
+                cp -p "$workdir/$f" "$HOME/$f"
+            fi
+        done
+    echo "restored $file"
+    have=$(find "$workdir/${state_dir#"$HOME"/}" -name '*.tsv' -printf '%f\n' \
+        2>/dev/null | sed 's/\.tsv$//' | sort | paste -sd ' ')
+    echo "snapshots: ${have:-none}; this container: $container"
+    while IFS=$'\t' read -r kind label dir; do
+        [ -d "$dir" ] && continue
+        echo "missing ($kind) $label: $dir"
+        [ "$kind" = session ] && rc=3
+    done < "$workdir/claude-backup/manifest.tsv"
+    [ $rc = 0 ] || echo "clone or create the session directories before resume" >&2
+    return $rc
+}
+
 rename() {
     local name sock bin wid
     located_sessions | while IFS=$'\t' read -r name _ _ _ sock bin _ _ wid; do
@@ -197,9 +319,11 @@ rename() {
 
 case "${1:-}" in
     save) save ;;
-    restore) shift; restore "$@" ;;
+    resume) shift; resume "$@" ;;
     rename) rename ;;
     sync) save; rename ;;
     list) column -t -s $'\t' "$state" ;;
-    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+    backup) shift; backup "$@" ;;
+    restore) shift; restore "$@" ;;
+    *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
