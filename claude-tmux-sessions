@@ -72,6 +72,16 @@
 # which other sessions rewrite while they run, so Claude Code asks
 # for trust again on the first start in the new directory.
 #
+# When the new directory is a git checkout with linked worktrees (the
+# main one, or a worktree of it), `move` also runs `git worktree
+# repair` there: the two record each other's absolute paths, so moving
+# either side leaves the worktree reporting "not a git repository".
+# From the main checkout it fixes the worktrees' .git files, from a
+# worktree its entry in the main one. A directory with such worktrees
+# and no sessions is still handled. A worktree under the moved
+# directory, moved along with it, needs `git worktree repair <path>`
+# by hand.
+#
 # Environment: CLAUDE_TMUX (the tmux program; overrides the recorded one,
 # else opentmux if installed, else tmux), CLAUDE_TMUX_SOCKET (server
 # name for sessions saved outside tmux, default fedora, i.e.
@@ -391,7 +401,14 @@ move() {
         fi
         printf '%s\t%s\n' "$d" "$projects/$(project_key "$new${dir#"$old"}")"
     done)
-    if [ -z "$plan" ]; then
+    # a git checkout with linked worktrees: they record each other's
+    # absolute paths, so moving either side breaks the link
+    worktrees=0
+    if [ -e "$new/.git" ]; then
+        worktrees=$(git -C "$new" worktree list --porcelain 2>/dev/null |
+            grep -c '^worktree ' || true)
+    fi
+    if [ -z "$plan" ] && [ "$worktrees" -le 1 ]; then
         echo "no sessions recorded for $old" >&2
         exit 1
     fi
@@ -418,7 +435,7 @@ move() {
 
     # a file in both folders, other than MEMORY.md, stops everything
     conflicts=$(while IFS=$'\t' read -r src dest; do
-        [ -d "$dest" ] || continue
+        [ -n "$src" ] && [ -d "$dest" ] || continue
         (cd "$src" && find . -type f) | while read -r rel; do
             rel=${rel#./}
             [ "$rel" != memory/MEMORY.md ] || continue
@@ -437,6 +454,7 @@ move() {
     done)
 
     while IFS=$'\t' read -r src dest; do
+        [ -n "$src" ] || continue
         if [ -d "$dest" ]; then
             echo "merge $src into $dest"
         else
@@ -444,11 +462,14 @@ move() {
         fi
     done <<<"$plan"
     [ -z "$rows" ] || printf 'update snapshot entries:\n%s\n' "$rows"
+    [ "$worktrees" -le 1 ] ||
+        echo "repair the links of $new's git worktrees ($worktrees in all)"
     if [ $dry = 1 ]; then
         return 0
     fi
 
     while IFS=$'\t' read -r src dest; do
+        [ -n "$src" ] || continue
         while read -r f; do
             rewrite_cwd "$f" "$old" "$new"
         done < <(find "$src" -name '*.jsonl')
@@ -483,9 +504,16 @@ move() {
         if cmp -s "$f" "$tmp"; then rm "$tmp"; else mv "$tmp" "$f"; fi
     done
 
+    # from the main checkout this fixes the linked worktrees' .git
+    # files, from a linked worktree its entry in the main checkout
+    if [ "$worktrees" -gt 1 ]; then
+        git -C "$new" worktree repair
+        git -C "$new" worktree list
+    fi
+
     # what is left to do by hand
     while IFS=$'\t' read -r _ dest; do
-        [ -d "$dest/memory" ] || continue
+        [ -n "$dest" ] && [ -d "$dest/memory" ] || continue
         grep -rlF "$old" "$dest/memory" | sed 's/^/mentions the old path: /'
     done <<<"$plan"
     if jq -e --arg d "$old" '.projects | has($d)' "$HOME/.claude.json" \
@@ -494,7 +522,8 @@ move() {
         echo "~/.claude.json keeps the settings of $old (trust, allowed" \
             "tools); Claude Code asks for trust again in $new"
     fi
-    echo "resume from $new with claude --resume <id>, or with resume"
+    [ -z "$plan" ] ||
+        echo "resume from $new with claude --resume <id>, or with resume"
 }
 
 rename() {
