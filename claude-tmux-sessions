@@ -47,7 +47,8 @@
 # folder: it writes claude-backup-<host>-<time>.tar.zst.gpg with every
 # container's snapshot and ~/.claude/projects (transcripts and memory),
 # encrypted with `gpg --symmetric` (gpg asks for the passphrase). The
-# transcripts of sessions under ~/src/embargoed are left out. `restore`
+# transcripts and memory of sessions in a CLAUDE_BACKUP_EXCLUDE
+# directory, or under one, are left out. `restore`
 # decrypts one, copies in each file that is missing here or older (a
 # newer local transcript is kept), and lists the session and
 # transcript directories that don't exist on this machine; it exits 3
@@ -84,8 +85,9 @@
 #
 # Environment: CLAUDE_TMUX (the tmux program; overrides the recorded one,
 # else opentmux if installed, else tmux), CLAUDE_TMUX_SOCKET (server
-# name for sessions saved outside tmux, default fedora, i.e.
-# `opentmux -L fedora`).
+# name for sessions saved outside tmux, default claude, i.e.
+# `tmux -L claude`), CLAUDE_BACKUP_EXCLUDE (directories, separated by
+# ":", whose sessions backup leaves out, e.g. work under embargo).
 set -euo pipefail
 umask 077
 
@@ -94,6 +96,7 @@ state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux-sessions
 state=$state_dir/$container.tsv
 # extra gpg options for backup and restore (used by tests)
 read -ra gpg_opts <<<"${CLAUDE_BACKUP_GPG_OPTS:-}"
+IFS=: read -ra backup_exclude <<<"${CLAUDE_BACKUP_EXCLUDE:-}"
 
 # backup and restore store paths relative to the home directory
 need_state_in_home() {
@@ -102,7 +105,7 @@ need_state_in_home() {
     esac
 }
 fallback_bin=$(command -v opentmux || echo tmux)
-default_socket=${CLAUDE_TMUX_SOCKET:-fedora}
+default_socket=${CLAUDE_TMUX_SOCKET:-claude}
 
 # the tmux program to use for a server recorded as run by $1
 pick_bin() {
@@ -267,8 +270,25 @@ project_cwd() {
     return 1
 }
 
+# the project folders (names under ~/.claude/projects) that backup
+# leaves out: those of each CLAUDE_BACKUP_EXCLUDE directory and of the
+# directories under it. Folder names write "/" and "-" alike, so a
+# sibling named like a subdirectory (~/src/private-old for
+# ~/src/private) is left out too, erring on the side of leaving out.
+excluded_projects() {
+    local e k d
+    for e in ${backup_exclude[@]+"${backup_exclude[@]}"}; do
+        [ -n "$e" ] || continue
+        k=$(project_key "$(readlink -m "$e")")
+        for d in "$HOME/.claude/projects/$k" "$HOME/.claude/projects/$k"-*; do
+            if [ -d "$d" ]; then basename "$d"; fi
+        done
+    done
+}
+
 # kind<TAB>label<TAB>directory for what a backup needs on the other
-# machine: each saved session's directory, then each project's
+# machine: each saved session's directory, then each project's, except
+# the folders named in the array skip
 backup_manifest() {
     local f d cwd
     for f in "$state_dir"/*.tsv; do
@@ -277,14 +297,17 @@ backup_manifest() {
     done
     for d in "$HOME"/.claude/projects/*/; do
         d=${d%/}
-        case $d in *-src-embargoed*) continue ;; esac
+        if printf '%s\n' ${skip[@]+"${skip[@]}"} |
+            grep -qxF -- "$(basename "$d")"; then
+            continue
+        fi
         cwd=$(project_cwd "$d") || continue
         printf 'transcripts\t%s\t%s\n' "$(basename "$d")" "$cwd"
     done
 }
 
 backup() {
-    local dest=${1:-} out
+    local dest=${1:-} out p skip excludes=()
     [ -n "$dest" ] || { echo "usage: $0 backup <dir>" >&2; exit 2; }
     [ -d "$dest" ] || { echo "$dest is not a directory" >&2; exit 1; }
     need_state_in_home
@@ -295,10 +318,14 @@ backup() {
     workdir=$(mktemp -d)
     trap 'rm -rf "$workdir"' EXIT
     mkdir "$workdir/claude-backup"
+    mapfile -t skip < <(excluded_projects)
+    for p in ${skip[@]+"${skip[@]}"}; do
+        excludes+=("--exclude=.claude/projects/$p")
+        echo "leaving out $p"
+    done
     backup_manifest > "$workdir/claude-backup/manifest.tsv"
     # a partial file must not sync, so write next to it and rename
-    tar -cf - -C "$HOME" \
-            --exclude='.claude/projects/*-src-embargoed*' \
+    tar -cf - -C "$HOME" ${excludes[@]+"${excludes[@]}"} \
             .claude/projects \
             "${state_dir#"$HOME"/}" \
             -C "$workdir" claude-backup/manifest.tsv |
