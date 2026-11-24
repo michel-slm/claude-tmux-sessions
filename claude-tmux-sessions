@@ -307,16 +307,18 @@ backup_manifest() {
 }
 
 backup() {
-    local dest=${1:-} out p skip excludes=()
+    local dest=${1:-} p skip excludes=()
     [ -n "$dest" ] || { echo "usage: $0 backup <dir>" >&2; exit 2; }
     [ -d "$dest" ] || { echo "$dest is not a directory" >&2; exit 1; }
     need_state_in_home
     save
-    out=$dest/claude-backup-$(hostname -s)-$(date +%Y%m%dT%H%M).tar.zst.gpg
     # global, and on EXIT: with set -e a failure exits without
     # returning, and the trap runs after the function's locals are gone
+    out=$dest/claude-backup-$(hostname -s)-$(date +%Y%m%dT%H%M).tar.zst.gpg
     workdir=$(mktemp -d)
-    trap 'rm -rf "$workdir"' EXIT
+    trap 'rm -rf "$workdir"; rm -f "$out.part"' EXIT
+    # nothing saved yet on this machine: no snapshot directory
+    mkdir -p "$state_dir"
     mkdir "$workdir/claude-backup"
     mapfile -t skip < <(excluded_projects)
     for p in ${skip[@]+"${skip[@]}"}; do
